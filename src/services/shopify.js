@@ -254,9 +254,14 @@ async function notifyCustomerShipping({
   };
 
   // Detect the courier from, in order of confidence:
-  //  1. the fulfillment's carrier name  2. the AWB prefix pattern
-  //  3. the order's shipping method title (carrier often left on "Other")
-  let { courier, fallback } = detectCourierSync(trackingCompany, trackingNumber);
+  //  1. the fulfillment's carrier name (what was actually used)
+  //  2. the order's shipping method title (merchant-chosen, stable —
+  //     covers manual fulfillments where the carrier is left on "Other")
+  //  3. the AWB prefix pattern, as a last resort (AWB formats vary,
+  //     especially aggregator waybills like KAJ.../JO...)
+  let courier = matchCourier(SUPPORTED_COURIERS, trackingCompany);
+  let fallback = courier ? null : matchCourier(FALLBACK_COURIERS, trackingCompany);
+
   if (!courier && !fallback && orderId) {
     const { shippingTitle } = await getOrderInfo();
     if (shippingTitle) {
@@ -264,6 +269,17 @@ async function notifyCustomerShipping({
       fallback = courier ? null : matchCourier(FALLBACK_COURIERS, shippingTitle);
       if (courier || fallback) {
         console.log(`   🔎 Courier detected from order shipping method "${shippingTitle.trim()}"`);
+      }
+    }
+  }
+
+  if (!courier && !fallback && trackingNumber) {
+    const hit = AWB_PATTERNS.find((p) => p.pattern.test(String(trackingNumber).trim()));
+    if (hit) {
+      courier = SUPPORTED_COURIERS.find((c) => c.slug === hit.slug) || null;
+      fallback = FALLBACK_COURIERS.find((c) => c.slug === hit.slug) || null;
+      if (courier || fallback) {
+        console.log(`   🔎 Courier detected from AWB pattern (${hit.slug})`);
       }
     }
   }
