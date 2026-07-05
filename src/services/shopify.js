@@ -74,9 +74,12 @@ function fallbackTrackingUrl(trackingCompany, trackingNumber) {
   return fallback.urlTemplate.replace('{awb}', encodeURIComponent(trackingNumber || ''));
 }
 
-// Base tracking page URL from env. Supports ${SHOP} placeholder so it
-// works for multiple shops, e.g. SHOPIFY_URL=https://${SHOP}/pages/tracking-page
+// Base tracking page URL. A store's SHOPIFY_STORES entry can set "url"
+// (e.g. a custom domain like https://wearemandalas.com/pages/tracking-page);
+// otherwise SHOPIFY_URL is used, with ${SHOP} replaced by the shop domain.
 function trackingPageBase(shopDomain) {
+  const entry = parseStores()[(shopDomain || '').toLowerCase()];
+  if (entry?.url) return entry.url;
   const template = process.env.SHOPIFY_URL || `https://${shopDomain}/pages/tracking-page`;
   return template.replace('${SHOP}', shopDomain).replace('#{SHOP}', shopDomain);
 }
@@ -97,14 +100,60 @@ function buildTrackingPageUrl(shopDomain, { trackingNumber, courier, phoneLastDi
   return `${base}${base.includes('?') ? '&' : '?'}${params.toString()}`;
 }
 
-// Check the shop that sent the webhook is one we manage (SHOP can be comma separated).
+// Per-store credentials for multitenant setups. SHOPIFY_STORES is a JSON
+// object keyed by shop domain:
+//   SHOPIFY_STORES={"happytap.myshopify.com":{"token":"shpca_...","webhookSecret":"..."},
+//                   "hafidz-dev.myshopify.com":{"token":"shpat_...","webhookSecret":"..."}}
+// Falls back to SHOPIFY_ACCESS_TOKEN / SHOPIFY_WEBHOOK_SECRET when a shop
+// has no entry (single-store backwards compatibility).
+function parseStores() {
+  try {
+    return JSON.parse(process.env.SHOPIFY_STORES || '{}');
+  } catch (err) {
+    console.error('❌ SHOPIFY_STORES is not valid JSON:', err.message);
+    return {};
+  }
+}
+
+// Alternative multitenant format: comma-separated lists aligned by position
+// with SHOP, e.g.
+//   SHOP=happytap.myshopify.com,hafidz-dev.myshopify.com
+//   SHOPIFY_ACCESS_TOKEN=shpca_aaa,shpca_bbb
+//   SHOPIFY_WEBHOOK_SECRET=secret-for-happytap,secret-for-hafidz-dev
+// A single value (no comma) keeps working for single-store setups.
+function envListConfig(shopDomain) {
+  const splitList = (v) => (v || '').split(',').map((s) => s.trim()).filter(Boolean);
+  const shops = splitList(process.env.SHOP).map((s) => s.toLowerCase());
+  const tokens = splitList(process.env.SHOPIFY_ACCESS_TOKEN);
+  const secrets = splitList(process.env.SHOPIFY_WEBHOOK_SECRET);
+  const idx = shops.indexOf((shopDomain || '').toLowerCase());
+  return {
+    token: (idx >= 0 && tokens[idx]) || tokens[0],
+    webhookSecret: (idx >= 0 && secrets[idx]) || secrets[0],
+  };
+}
+
+function getShopConfig(shopDomain) {
+  const entry = parseStores()[(shopDomain || '').toLowerCase()];
+  const listCfg = envListConfig(shopDomain);
+  return {
+    token: entry?.token || listCfg.token,
+    webhookSecret: entry?.webhookSecret || listCfg.webhookSecret,
+  };
+}
+
+// Check the shop that sent the webhook is one we manage: listed in
+// SHOPIFY_STORES or in SHOP (comma separated).
 function isKnownShop(shopDomain) {
+  const domain = (shopDomain || '').toLowerCase();
+  const stores = Object.keys(parseStores()).map((s) => s.toLowerCase());
   const shops = (process.env.SHOP || '')
     .split(',')
     .map((s) => s.trim().toLowerCase())
     .filter(Boolean);
-  if (shops.length === 0) return true; // no allowlist configured
-  return shops.includes((shopDomain || '').toLowerCase());
+  const known = [...stores, ...shops];
+  if (known.length === 0) return true; // no allowlist configured
+  return known.includes(domain);
 }
 
 function lastDigits(phone, count) {
@@ -116,7 +165,7 @@ function lastDigits(phone, count) {
 // Fallback: fetch the recipient's phone from the order when the
 // fulfillment's destination has none. Requires read_orders scope.
 async function fetchOrderPhone(shopDomain, orderId) {
-  const token = process.env.SHOPIFY_ACCESS_TOKEN;
+  const { token } = getShopConfig(shopDomain);
   const url = `https://${shopDomain}/admin/api/${API_VERSION()}/orders/${orderId}.json?fields=phone,shipping_address,customer`;
   const res = await fetch(url, { headers: { 'X-Shopify-Access-Token': token } });
   if (!res.ok) {
@@ -147,8 +196,8 @@ async function notifyCustomerShipping({
   destinationPhone,
   existingTrackingUrl,
 }) {
-  const token = process.env.SHOPIFY_ACCESS_TOKEN;
-  if (!token) throw new Error('SHOPIFY_ACCESS_TOKEN is not set');
+  const { token } = getShopConfig(shopDomain);
+  if (!token) throw new Error(`No access token configured for ${shopDomain} (SHOPIFY_STORES or SHOPIFY_ACCESS_TOKEN)`);
 
   const courier = resolveCourier(trackingCompany);
 
@@ -218,4 +267,5 @@ module.exports = {
   resolveCourier,
   fallbackTrackingUrl,
   isKnownShop,
+  getShopConfig,
 };

@@ -7,6 +7,7 @@ const {
   fallbackTrackingUrl,
   resolveCourier,
   isKnownShop,
+  getShopConfig,
 } = require('../services/shopify');
 
 // Best-effort dedup of Shopify webhook retries (in-memory, per instance)
@@ -26,10 +27,10 @@ router.use(
   express.raw({ type: 'application/json' })
 );
 
-// Helper: verify Shopify HMAC signature
-function verifyShopifyWebhook(req) {
+// Helper: verify Shopify HMAC signature with the shop's own secret
+// (each store signs its webhooks with a different secret)
+function verifyShopifyWebhook(req, secret) {
   const hmacHeader = req.headers['x-shopify-hmac-sha256'];
-  const secret = process.env.SHOPIFY_WEBHOOK_SECRET;
 
   if (!secret || !hmacHeader) return false;
 
@@ -38,7 +39,9 @@ function verifyShopifyWebhook(req) {
     .update(req.body) // raw Buffer
     .digest('base64');
 
-  return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmacHeader));
+  const a = Buffer.from(digest);
+  const b = Buffer.from(hmacHeader);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
 // GET  /api/webhook  — health check
@@ -52,10 +55,13 @@ router.get('/', (req, res) => {
 
 // POST /api/webhook  — receive Shopify fulfillment/creation events
 router.post('/', async (req, res) => {
-  // Verify signature (skip if no secret configured, useful during dev)
-  if (process.env.SHOPIFY_WEBHOOK_SECRET) {
-    if (!verifyShopifyWebhook(req)) {
-      console.warn('⚠️  Invalid Shopify HMAC signature – request rejected');
+  const shopHeader = req.headers['x-shopify-shop-domain'] || 'unknown';
+
+  // Verify signature with this shop's secret (skip if none configured, useful during dev)
+  const { webhookSecret } = getShopConfig(shopHeader);
+  if (webhookSecret) {
+    if (!verifyShopifyWebhook(req, webhookSecret)) {
+      console.warn(`⚠️  Invalid Shopify HMAC signature from ${shopHeader} – request rejected`);
       return res.status(401).json({ error: 'Unauthorized: invalid HMAC signature' });
     }
   }
