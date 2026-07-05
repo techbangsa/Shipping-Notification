@@ -4,8 +4,8 @@ const crypto = require('crypto');
 const {
   notifyCustomerShipping,
   trackingPageBase,
-  fallbackTrackingUrl,
-  resolveCourier,
+  detectCourierSync,
+  isFallbackUrl,
   isKnownShop,
   getShopConfig,
 } = require('../services/shopify');
@@ -103,14 +103,15 @@ router.post('/', async (req, res) => {
     // Loop guard: our own update_tracking call fires fulfillments/update.
     // Skip when the tracking URL is already what we would set:
     //  - our tracking page (RajaOngkir-supported couriers)
-    //  - the official-site fallback URL for this courier
-    //  - any URL on an unknown courier (GoSend etc.) — we keep those as-is
+    //  - any official-site fallback URL (couriers RajaOngkir can't track)
+    //  - any URL on an undetectable courier (GoSend etc.) — we keep those as-is
+    const detected = detectCourierSync(tracking_company, tracking_number);
     const isOwnUpdate =
       topic === 'fulfillments/update' &&
       typeof tracking_url === 'string' &&
       (tracking_url.startsWith(trackingPageBase(shop)) ||
-        tracking_url === fallbackTrackingUrl(tracking_company, tracking_number) ||
-        (!resolveCourier(tracking_company) && !fallbackTrackingUrl(tracking_company, tracking_number)));
+        isFallbackUrl(tracking_url) ||
+        (!detected.courier && !detected.fallback));
 
     if (status === 'cancelled' || status === 'error' || status === 'failure') {
       console.log(`   ⏭️  Skipping notification (fulfillment status: ${status})`);
