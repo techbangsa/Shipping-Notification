@@ -9,7 +9,7 @@ const API_VERSION = () => process.env.API_VERSION || '2026-01';
 // No AWB checking (excluded): ide, sentral, rex.
 const SUPPORTED_COURIERS = [
   { slug: 'jne', phoneDigits: 5, matches: ['jne'] },
-  { slug: 'jnt', phoneDigits: 4, matches: ['jnt', 'jtexpress', 'jtekspres'] },
+  { slug: 'jnt', phoneDigits: 4, matches: ['jnt', 'jtexpress', 'jtekspres', 'jtez', 'jteco', 'jtsuper', 'jandt'] },
   { slug: 'sicepat', phoneDigits: 0, matches: ['sicepat'] },
   { slug: 'sap', phoneDigits: 0, matches: ['sapexpress', 'sapekspres'] },
   { slug: 'ninja', phoneDigits: 0, matches: ['ninja'] },
@@ -52,8 +52,10 @@ const AWB_PATTERNS = [
   { slug: 'tiki', pattern: /^TIKI/i },            // TIKIBTS100000111380
   { slug: 'ide', pattern: /^IDE\d/i },            // IDE7000910703355
   { slug: 'spx', pattern: /^SPX/i },              // SPXID04...
-  { slug: 'jnt', pattern: /^(JP|JT|JD)\d{8,}$/i },// JP1234567890
+  { slug: 'jnt', pattern: /^(JP|JT|JD|JO)\d{8,}$/i }, // JP1234567890, JO0325596223 (EZ)
   { slug: 'paxel', pattern: /^EM\./i },           // EM.L7S6JYQ48W-...
+  { slug: 'lion', pattern: /^\d{2}LP\d/i },       // 99LP1783206910626
+  { slug: 'sicepat', pattern: /^00\d{10}$/ },     // 005000071858 (12 digits, starts 00)
 ];
 
 // Resolve courier from carrier name first, then from the AWB pattern.
