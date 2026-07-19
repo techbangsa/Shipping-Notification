@@ -5,11 +5,12 @@ const API_VERSION = () => process.env.API_VERSION || '2026-01';
 // Couriers with "Checking AWB" support on the RajaOngkir proxy
 // (rajaongkir-proxy/api/tracking.js). Slug must match both the proxy's
 // courier code and the <option value> in the tracking page's select.
-// phoneDigits mirrors the proxy's COURIER_PHONE_DIGITS (jne: 5, jnt: 4).
+// phoneDigits mirrors the proxy's COURIER_PHONE_DIGITS (jne: 5).
+// J&T does not require phone verification on the RajaOngkir API.
 // No AWB checking (excluded): ide, sentral, rex.
 const SUPPORTED_COURIERS = [
   { slug: 'jne', phoneDigits: 5, matches: ['jne'] },
-  { slug: 'jnt', phoneDigits: 4, matches: ['jnt', 'jtexpress', 'jtekspres', 'jtez', 'jteco', 'jtsuper', 'jandt'] },
+  { slug: 'jnt', phoneDigits: 0, matches: ['jnt', 'jtexpress', 'jtekspres', 'jtez', 'jteco', 'jtsuper', 'jandt'] },
   { slug: 'sicepat', phoneDigits: 0, matches: ['sicepat'] },
   { slug: 'sap', phoneDigits: 0, matches: ['sapexpress', 'sapekspres'] },
   { slug: 'ninja', phoneDigits: 0, matches: ['ninja'] },
@@ -229,6 +230,66 @@ async function fetchOrderInfo(shopDomain, orderId) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// "Already notified" marker, stored on the order as a metafield so it
+// survives serverless restarts (in-memory state does not on Vercel).
+// namespace east_rose, key awb_<fulfillmentId>, value = tracking number
+// (or the app's tracking URL for URL-only couriers like GoSend).
+// Reading needs read_orders, writing needs write_orders — on 403 we log a
+// hint and the webhook falls back to in-memory dedup only.
+// ---------------------------------------------------------------------------
+const METAFIELD_NAMESPACE = 'east_rose';
+
+async function getNotifiedTracking(shopDomain, orderId, fulfillmentId) {
+  const none = { value: null, metafieldId: null };
+  const { token } = getShopConfig(shopDomain);
+  if (!token || !orderId || !fulfillmentId) return none;
+  try {
+    const key = `awb_${fulfillmentId}`;
+    const url = `https://${shopDomain}/admin/api/${API_VERSION()}/orders/${orderId}/metafields.json?namespace=${METAFIELD_NAMESPACE}&key=${key}`;
+    const res = await fetch(url, { headers: { 'X-Shopify-Access-Token': token } });
+    if (!res.ok) {
+      const hint = res.status === 403 ? ' — grant read_orders/write_orders to dedup across restarts' : '';
+      console.warn(`   ⚠️  Could not read notified-tracking metafield (${res.status})${hint}`);
+      return none;
+    }
+    const { metafields } = await res.json();
+    const mf = metafields?.[0];
+    return { value: mf?.value != null ? String(mf.value) : null, metafieldId: mf?.id || null };
+  } catch (err) {
+    console.warn(`   ⚠️  Could not read notified-tracking metafield: ${err.message}`);
+    return none;
+  }
+}
+
+async function markNotifiedTracking(shopDomain, orderId, fulfillmentId, value, metafieldId) {
+  const { token } = getShopConfig(shopDomain);
+  if (!token || !orderId || !fulfillmentId || !value) return;
+  try {
+    const base = `https://${shopDomain}/admin/api/${API_VERSION()}/orders/${orderId}/metafields`;
+    const url = metafieldId ? `${base}/${metafieldId}.json` : `${base}.json`;
+    const metafield = metafieldId
+      ? { id: metafieldId, value: String(value), type: 'single_line_text_field' }
+      : {
+          namespace: METAFIELD_NAMESPACE,
+          key: `awb_${fulfillmentId}`,
+          type: 'single_line_text_field',
+          value: String(value),
+        };
+    const res = await fetch(url, {
+      method: metafieldId ? 'PUT' : 'POST',
+      headers: { 'X-Shopify-Access-Token': token, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ metafield }),
+    });
+    if (!res.ok) {
+      const hint = res.status === 403 ? ' — grant write_orders to dedup across restarts' : '';
+      console.warn(`   ⚠️  Could not save notified-tracking metafield (${res.status})${hint}`);
+    }
+  } catch (err) {
+    console.warn(`   ⚠️  Could not save notified-tracking metafield: ${err.message}`);
+  }
+}
+
 /**
  * Update a fulfillment's tracking info and ask Shopify to email the customer.
  * Shopify sends its native "Shipping confirmation" (or "Shipping update")
@@ -284,7 +345,7 @@ async function notifyCustomerShipping({
     }
   }
 
-  // JNE/J&T tracking needs the last digits of the recipient's phone number
+  // JNE tracking needs the last digits of the recipient's phone number
   let phoneLastDigits = null;
   if (courier && courier.phoneDigits > 0) {
     let phone = destinationPhone;
@@ -341,6 +402,8 @@ async function notifyCustomerShipping({
 
 module.exports = {
   notifyCustomerShipping,
+  getNotifiedTracking,
+  markNotifiedTracking,
   buildTrackingPageUrl,
   trackingPageBase,
   resolveCourier,

@@ -3,6 +3,8 @@ const router = express.Router();
 const crypto = require('crypto');
 const {
   notifyCustomerShipping,
+  getNotifiedTracking,
+  markNotifiedTracking,
   trackingPageBase,
   detectCourierSync,
   isFallbackUrl,
@@ -20,6 +22,17 @@ function alreadyProcessed(webhookId) {
     processedWebhooks.delete(processedWebhooks.values().next().value);
   }
   return false;
+}
+
+// In-memory layer of the once-per-AWB dedup (fulfillmentId → tracking key).
+// The durable copy lives in an order metafield (see services/shopify.js);
+// this map just saves an API call on warm instances.
+const notifiedTracking = new Map();
+function rememberNotified(fulfillmentId, trackingKey) {
+  notifiedTracking.set(fulfillmentId, trackingKey);
+  if (notifiedTracking.size > 500) {
+    notifiedTracking.delete(notifiedTracking.keys().next().value);
+  }
 }
 
 // Middleware to capture raw body for HMAC verification
@@ -100,6 +113,12 @@ router.post('/', async (req, res) => {
 
     const webhookId = req.headers['x-shopify-webhook-id'];
 
+    // What this event would notify the customer about: the AWB, or the
+    // shipping app's own tracking URL for URL-only couriers (GoSend etc.).
+    // Fulfillment apps like Jubelio re-push the same tracking info many
+    // times; the customer only needs one email per tracking key.
+    const trackingKey = tracking_number || tracking_url || null;
+
     // Loop guard: our own update_tracking call fires fulfillments/update.
     // Skip when the tracking URL is already what we would set:
     //  - our tracking page (RajaOngkir-supported couriers)
@@ -121,20 +140,33 @@ router.post('/', async (req, res) => {
       console.log('   ⏭️  Skipping notification (update triggered by our own tracking update)');
     } else if (alreadyProcessed(webhookId)) {
       console.log('   ⏭️  Skipping notification (duplicate webhook delivery)');
+    } else if (!trackingKey) {
+      console.log('   ⏭️  Skipping notification (no tracking info yet — will notify once tracking is added)');
+    } else if (notifiedTracking.get(id) === trackingKey) {
+      console.log('   ⏭️  Skipping notification (already notified for this tracking info)');
     } else {
       try {
-        const { trackingPageUrl, courier } = await notifyCustomerShipping({
-          shopDomain: shop,
-          fulfillmentId: id,
-          orderId: order_id,
-          trackingNumber: tracking_number,
-          trackingCompany: tracking_company,
-          destinationPhone: payload.destination?.phone,
-          existingTrackingUrl: tracking_url,
-        });
-        console.log(`   ✅ Shopify shipping email sent to customer`);
-        console.log(`   🚛 Courier slug   : ${courier || '(unsupported — plain page link)'}`);
-        console.log(`   🔗 Tracking link in email: ${trackingPageUrl}`);
+        // Durable check: have we already emailed for this exact tracking key?
+        const { value: lastNotified, metafieldId } = await getNotifiedTracking(shop, order_id, id);
+        if (lastNotified === String(trackingKey)) {
+          rememberNotified(id, trackingKey);
+          console.log('   ⏭️  Skipping notification (already notified for this tracking info)');
+        } else {
+          const { trackingPageUrl, courier } = await notifyCustomerShipping({
+            shopDomain: shop,
+            fulfillmentId: id,
+            orderId: order_id,
+            trackingNumber: tracking_number,
+            trackingCompany: tracking_company,
+            destinationPhone: payload.destination?.phone,
+            existingTrackingUrl: tracking_url,
+          });
+          rememberNotified(id, trackingKey);
+          await markNotifiedTracking(shop, order_id, id, trackingKey, metafieldId);
+          console.log(`   ✅ Shopify shipping email sent to customer`);
+          console.log(`   🚛 Courier slug   : ${courier || '(unsupported — plain page link)'}`);
+          console.log(`   🔗 Tracking link in email: ${trackingPageUrl}`);
+        }
       } catch (err) {
         // Log but still return 200 — a 5xx would make Shopify retry the webhook
         console.error(`   ❌ Failed to send shipping notification: ${err.message}`);
